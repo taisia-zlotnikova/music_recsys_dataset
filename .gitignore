@@ -1,0 +1,6 @@
+/_archive/
+/data/
+/reports/cards.jsonl
+__pycache__/
+*.pyc
+.DS_Store
