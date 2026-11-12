@@ -1,0 +1,6 @@
+# Python 3.10+. Версии Qwen/PEFT фиксированы из-за перенесённого attention.
+numpy>=1.23,<3
+pyarrow>=14
+torch==2.8.0
+transformers==4.57.6
+peft==0.17.1
