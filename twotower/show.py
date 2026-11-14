@@ -61,7 +61,8 @@ def main():
             model = build_model(features, config, device, a.local_files_only)
             load_trainable(model, saved['weights'])
             model.eval()
-            batch = Collator(manifest['pad_id'], manifest['history_only_tokens'], config['mode'])([row])
+            batch = Collator(manifest['pad_id'], manifest['history_only_tokens'], config['mode'],
+                             config.get('history_limit', config['history_len']))([row])
             with torch.no_grad(), autocast(device):
                 scores = model.scores(to_device(batch, device))[0]
             print('\nРекомендации:')

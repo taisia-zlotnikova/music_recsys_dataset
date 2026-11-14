@@ -234,3 +234,87 @@ def test_short_training_resume_and_lora(tmp_path):
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0
                for n, p in lora.named_parameters() if 'lora_' in n)
+
+
+@pytest.mark.parametrize('use_history', [True, False])
+def test_all_attention_adapters_freeze_backbone_and_reload(use_history):
+    import copy
+    from twotower.model import enable_adapter_training
+    m = model(use_history=use_history)
+    # Одинаковые исходные предобученные веса, до добавления адаптеров.
+    fresh = copy.deepcopy(m)
+    enable_adapter_training(m, 2)
+    enable_adapter_training(fresh, 2)
+    frozen = {n: p.detach().clone() for n, p in m.named_parameters() if not p.requires_grad}
+    optimizer = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=0.01)
+    b = batch() if use_history else Collator(0, [12, 1], 'text')(rows())
+    # Нулевые gates пропускают градиент в историю после первого обновления gate.
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        loss = m(b)
+        assert torch.isfinite(loss)
+        loss.backward()
+        optimizer.step()
+    for n, p in m.named_parameters():
+        if n in frozen:
+            assert p.grad is None and torch.equal(p, frozen[n])
+    prefixes = ['user.base.'] + (['user.encoder.', 'user.cross.'] if use_history else [])
+    for prefix in prefixes:
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for n, p in m.named_parameters()
+                   if n.startswith(prefix) and 'lora_B' in n)
+    assert m.item.tags.weight.grad.abs().sum() > 0
+    if use_history:
+        assert m.user.track_in.weight.grad.abs().sum() > 0
+    saved = trainable_state(m)
+    assert not any('base_layer' in n for n in saved)
+    load_trainable(fresh, saved)
+    assert torch.allclose(m.eval().scores(b), fresh.eval().scores(b), atol=1e-6)
+
+
+def test_budget_chooses_common_epochs():
+    from twotower.experiment import MODES, choose_epochs
+    current = dict.fromkeys(MODES, 20)
+    assert choose_epochs(dict.fromkeys(MODES, 40), current, 642, 22 * 3600) == 4
+    assert choose_epochs(dict.fromkeys(MODES, 10), current, 642, 22 * 3600) == 2
+    assert choose_epochs(dict.fromkeys(MODES, 1), current, 642, 22 * 3600) is None
+
+
+def test_adapter_time_limit_checkpoint_resumes(tmp_path):
+    import copy
+    from twotower.model import enable_adapter_training
+    writer = ShardWriter(tmp_path / 'data', 2)
+    for r in rows() * 3:
+        writer.add(r)
+    writer.finish()
+    dataset = TurnDataset(tmp_path / 'data')
+    m = model()
+    fresh = copy.deepcopy(m)
+    enable_adapter_training(m, 2)
+    enable_adapter_training(fresh, 2)
+    out = tmp_path / 'run'
+    out.mkdir()
+    manifest = {'pad_id': 0, 'history_only_tokens': [12, 1]}
+    config = {'mode': 'both', 'tuning': 'adapters'}
+    run_training(m, dataset, dataset, manifest, config, out, torch.device('cpu'),
+                 steps=3, batch_size=2, accumulation=1, eval_every=10, max_seconds=1e-9)
+    saved = torch.load(out / 'last.pt', weights_only=False)
+    assert saved['step'] == 1
+    load_trainable(fresh, saved['weights'])
+    run_training(fresh, dataset, dataset, manifest, config, out, torch.device('cpu'),
+                 steps=3, batch_size=2, accumulation=1, eval_every=10, resume=saved)
+    assert torch.load(out / 'last.pt', weights_only=False)['step'] == 3
+    assert (out / 'best.pt').exists()
+
+
+def test_history_limit_keeps_recent_rows_and_all_other_fields():
+    source = rows()
+    source[0]['history'] = np.array([[1, 1, 2], [2, 3, 4], [3, 5, 6]])
+    before = batch()
+    b = Collator(0, [12, 1], history_limit=2)(source)
+    assert b['hist'][0].tolist() == [2, 3]
+    assert b['hcount'][0].tolist() == [3, 5]
+    assert b['hage'][0].tolist() == [4, 6]
+    assert torch.equal(b['tok'], before['tok'])
+    assert torch.equal(b['targets'], before['targets'])
+    assert not b['hmask'][1].any()
+    assert Collator(0, [12, 1], 'text', history_limit=2)(source)['hist'].shape[1] == 0

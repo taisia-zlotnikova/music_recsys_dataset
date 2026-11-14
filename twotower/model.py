@@ -14,6 +14,45 @@ from torch.utils.checkpoint import checkpoint
 DEFAULT_ITEM_FEATURES = ('audio', 'text', 'tags')
 
 
+class LoRALinear(nn.Module):
+    """Замороженная проекция + обучаемая поправка ранга r; адаптеры в FP32."""
+    def __init__(self, linear, rank):
+        super().__init__()
+        self.base_layer = linear.requires_grad_(False)
+        self.lora_A = nn.Parameter(torch.empty(rank, linear.in_features, dtype=torch.float32,
+                                              device=linear.weight.device))
+        self.lora_B = nn.Parameter(torch.zeros(linear.out_features, rank, dtype=torch.float32,
+                                              device=linear.weight.device))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        self.dropout = nn.Dropout(0.05)
+        self.scale = 2.0  # alpha = 2 * rank
+
+    def forward(self, x):
+        original = self.base_layer(x)
+        delta = F.linear(F.linear(self.dropout(x).to(self.lora_A.dtype), self.lora_A), self.lora_B)
+        return original + (self.scale * delta).to(original.dtype)
+
+
+def enable_adapter_training(model, rank=8):
+    """Один этап: LoRA во всех attention, исходные Transformer-веса заморожены."""
+    if rank < 1:
+        raise ValueError('Для adapters нужен положительный lora_r')
+    user = model.user
+    for block in (user.base, user.encoder, user.cross, user.enc_norm):
+        block.requires_grad_(False)
+        # Список фиксируем до замены модулей, чтобы не обходить вложенные base_layer.
+        for parent in list(block.modules()):
+            for name, child in list(parent.named_children()):
+                if name in ('q_proj', 'k_proj', 'v_proj', 'o_proj') and isinstance(child, nn.Linear):
+                    setattr(parent, name, LoRALinear(child, rank))
+    for cross in user.cross.values():
+        cross.gate.requires_grad_(True)
+    if not user.use_history:
+        for block in (user.track_in, user.pos, user.count, user.age, user.track_norm):
+            block.requires_grad_(False)
+        user.null.requires_grad_(False)
+
+
 class TrackTower(nn.Module):
     def __init__(self, features, dim=256, channels=DEFAULT_ITEM_FEATURES):
         super().__init__()
@@ -230,7 +269,12 @@ def build_model(features, config, device, local_files_only=False):
                      item_features=config.get('item_features', DEFAULT_ITEM_FEATURES),
                      encoder_layers=config['encoder_layers'], cross_every=config['cross_every'],
                      use_history=config['mode'] != 'text')
-    if config.get('lora_r', 0):
+    tuning = config.get('tuning', 'legacy')
+    if tuning == 'adapters':
+        enable_adapter_training(model, config['lora_r'])
+    elif tuning != 'legacy':
+        raise ValueError(f'Неизвестный режим обучения: {tuning}')
+    elif config.get('lora_r', 0):
         from peft import LoraConfig, get_peft_model
         model.user.base = get_peft_model(model.user.base, LoraConfig(
             r=config['lora_r'], lora_alpha=2 * config['lora_r'], lora_dropout=0.05,

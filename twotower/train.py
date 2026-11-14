@@ -69,10 +69,12 @@ def save_checkpoint(path, model, optimizer, scaler, config, step, epoch, next_ba
 
 def run_training(model, train_data, val_data, manifest, config, out, device,
                  steps=1000, batch_size=8, accumulation=16, eval_every=100,
-                 lr=1e-3, copied_lr=1e-4, lora_lr=2e-5, seed=42, resume=None, data_hash=''):
+                 lr=1e-3, copied_lr=1e-4, lora_lr=2e-5, seed=42, resume=None, data_hash='',
+                 save_every=100, max_seconds=0):
     """steps — итоговое число optimizer steps, также при --resume."""
     out = Path(out)
-    collator = Collator(manifest['pad_id'], manifest['history_only_tokens'], config['mode'])
+    collator = Collator(manifest['pad_id'], manifest['history_only_tokens'], config['mode'],
+                        config.get('history_limit', manifest['history_len'] if 'history_len' in manifest else None))
     sampler = ShardSampler(train_data, seed)
     loader = DataLoader(train_data, batch_size=batch_size, sampler=sampler, collate_fn=collator,
                         generator=torch.Generator().manual_seed(seed))
@@ -81,7 +83,9 @@ def run_training(model, train_data, val_data, manifest, config, out, device,
     groups = {'new': [], 'copied': [], 'lora': []}
     for name, p in model.named_parameters():
         if p.requires_grad:
-            group = 'lora' if 'lora_' in name else 'copied' if name.startswith(('user.encoder.', 'user.cross.')) else 'new'
+            group = ('lora' if 'lora_' in name else 'copied'
+                     if config.get('tuning', 'legacy') == 'legacy'
+                     and name.startswith(('user.encoder.', 'user.cross.')) else 'new')
             groups[group].append(p)
     optimizer = torch.optim.AdamW([{'params': groups[k], 'lr': rate}
                                   for k, rate in [('new', lr), ('copied', copied_lr), ('lora', lora_lr)]
@@ -139,19 +143,27 @@ def run_training(model, train_data, val_data, manifest, config, out, device,
                    'temperature': model.log_temperature.exp().item()}
             if device.type == 'cuda':
                 log['peak_gpu_gb'] = torch.cuda.max_memory_allocated() / 1e9
+            stopping = bool(max_seconds and time.monotonic() - started >= max_seconds)
             if step % eval_every == 0 or step == steps:
                 metrics = evaluate(model, val_loader, device)
                 last_validation = metrics
                 log['val'] = metrics
                 improved = metrics['ndcg@100'] > best
                 best = max(best, metrics['ndcg@100'])
+                log['history_gates'] = [c.gate.tanh().item() for c in model.user.cross.values()]
                 for name in (['last.pt', 'best.pt'] if improved else ['last.pt']):
                     save_checkpoint(out / name, model, optimizer, scaler, config, step,
                                     epoch, index + 1, best, data_hash)
+            elif step % save_every == 0 or stopping:
+                save_checkpoint(out / 'last.pt', model, optimizer, scaler, config, step,
+                                epoch, index + 1, best, data_hash)
             with (out / 'metrics.jsonl').open('a') as f:
                 f.write(json.dumps(log) + '\n')
             print(json.dumps(log), flush=True)
             window, window_n = 0.0, 0
+            if stopping:
+                print('Лимит времени: last.pt сохранён; продолжение через --resume.', flush=True)
+                return last_validation
             if step >= steps:
                 break
         epoch += 1
@@ -171,10 +183,15 @@ def main():
     p.add_argument('--cross-every', type=int, default=4)
     p.add_argument('--dim', type=int, default=256)
     p.add_argument('--lora-r', type=int, default=0)
+    p.add_argument('--history-limit', type=int, help='Оставить последние N треков в train и val; данные не пересобираются')
+    p.add_argument('--tuning', choices=['legacy', 'adapters'], default='legacy',
+                   help='adapters: замороженные Transformer-веса, LoRA в decoder/encoder/cross')
     p.add_argument('--steps', type=int, default=1000)
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--accumulation', type=int, default=16)
     p.add_argument('--eval-every', type=int, default=100)
+    p.add_argument('--save-every', type=int, default=100)
+    p.add_argument('--max-seconds', type=float, default=0, help='0 = без ограничения; остановка с checkpoint')
     p.add_argument('--val-turns', type=int, default=5000, help='0 = все ходы подготовленной val')
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--copied-lr', type=float, default=1e-4)
@@ -186,8 +203,10 @@ def main():
     p.add_argument('--init', help='Взять обучаемые веса, начать новый этап/optimizer (например LoRA)')
     p.add_argument('--evaluate', help='Только оценить checkpoint, без обучения')
     a = p.parse_args()
-    if min(a.steps, a.batch_size, a.accumulation, a.eval_every) < 1 or a.val_turns < 0:
+    if min(a.steps, a.batch_size, a.accumulation, a.eval_every, a.save_every) < 1 or a.val_turns < 0 or a.max_seconds < 0:
         p.error('Число шагов/батч/накопление/интервал должны быть положительными')
+    if a.tuning == 'adapters' and a.lora_r < 1 and not a.evaluate:
+        p.error('--tuning adapters требует --lora-r 8 (или другой положительный ранг)')
     if sum(bool(x) for x in (a.resume, a.init, a.evaluate)) > 1:
         p.error('Выбери только один из --resume, --init, --evaluate')
     device = select_device(a.device)
@@ -196,13 +215,16 @@ def main():
     torch.manual_seed(a.seed)
     root = Path(a.data)
     manifest = json.loads((root / 'manifest.json').read_text())
+    history_limit = a.history_limit if a.history_limit is not None else manifest['history_len']
+    if not 1 <= history_limit <= manifest['history_len']:
+        p.error('history-limit должен быть от 1 до длины подготовленной истории')
     feature_hash, data_hash = file_hash(a.features), file_hash(root / 'manifest.json')
     check_catalog(root, a.features, manifest)
-    config = {k: getattr(a, k) for k in ['mode', 'dim', 'encoder_layers', 'cross_every', 'lora_r']}
+    config = {k: getattr(a, k) for k in ['mode', 'dim', 'encoder_layers', 'cross_every', 'lora_r', 'tuning']}
     config.update(model=manifest['model'], history_len=manifest['history_len'],
                   item_features=[s.strip() for s in a.item_features.split(',')],
                   feature_sha256=feature_hash, batch_size=a.batch_size, accumulation=a.accumulation,
-                  seed=a.seed, val_turns=a.val_turns)
+                  seed=a.seed, val_turns=a.val_turns, history_limit=history_limit)
     checkpoint_path = a.resume or a.init or a.evaluate
     checkpoint_data = torch.load(checkpoint_path, map_location='cpu', weights_only=False) if checkpoint_path else None
     if a.evaluate:
@@ -211,6 +233,10 @@ def main():
             raise ValueError('Для оценки нужны те же признаки и подготовленные данные')
     if checkpoint_data:
         old = checkpoint_data['config']
+        if old.get('tuning', 'legacy') != config.get('tuning', 'legacy'):
+            raise ValueError('Нельзя продолжить legacy-веса в adapters: начни новый эксперимент')
+        if old.get('history_limit', old['history_len']) != config.get('history_limit', config['history_len']):
+            raise ValueError('Длина входной истории не совпадает с checkpoint')
         required = ['model', 'mode', 'dim', 'history_len', 'encoder_layers', 'cross_every', 'feature_sha256']
         if a.resume:
             required += ['lora_r', 'batch_size', 'accumulation', 'seed', 'val_turns']
@@ -232,7 +258,8 @@ def main():
         with np.load(a.features) as features:
             model = build_model(features, config, device, a.local_files_only)
         load_trainable(model, checkpoint_data['weights'])
-        collator = Collator(manifest['pad_id'], manifest['history_only_tokens'], config['mode'])
+        collator = Collator(manifest['pad_id'], manifest['history_only_tokens'], config['mode'],
+                            config.get('history_limit', config['history_len']))
         metrics = evaluate(model, DataLoader(val_data, batch_size=a.batch_size, collate_fn=collator), device)
         result = {'checkpoint': a.evaluate, 'val_turns': len(val_data), 'metrics': metrics}
         Path(a.evaluate).with_name('evaluation.json').write_text(json.dumps(result, indent=2) + '\n')
@@ -252,7 +279,8 @@ def main():
           f'trainable={sum(p.numel() for p in model.parameters() if p.requires_grad):,}', flush=True)
     run_training(model, train_data, val_data, manifest, config, out, device,
                  a.steps, a.batch_size, a.accumulation, a.eval_every, a.lr, a.copied_lr,
-                 a.lora_lr, a.seed, checkpoint_data if a.resume else None, data_hash)
+                 a.lora_lr, a.seed, checkpoint_data if a.resume else None, data_hash,
+                 a.save_every, a.max_seconds)
 
 
 if __name__ == '__main__':

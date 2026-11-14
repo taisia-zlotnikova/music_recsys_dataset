@@ -3,6 +3,7 @@
 Синтетические музыкальные диалоги по сессиям Music4All-Onion. Скрипты просмотра и статистики: Python 3.9+, без сторонних библиотек.
 
 Обучение encoder–decoder: [команды и формат данных](twotower/README.md).
+Текущий эксперимент v2 с LoRA: [готовый Colab notebook](twotower/colab_lora.ipynb).
 
 ## Данные
 

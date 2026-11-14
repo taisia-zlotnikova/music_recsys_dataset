@@ -9,3 +9,5 @@ docs
 ChatExport*
 /runs/
 .pytest_cache/
+
+/dialogues.txt

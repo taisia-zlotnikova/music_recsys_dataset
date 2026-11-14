@@ -116,11 +116,16 @@ class ShardSampler(Sampler):
 
 
 class Collator:
-    def __init__(self, pad_id, history_only_tokens, mode='both'):
+    def __init__(self, pad_id, history_only_tokens, mode='both', history_limit=None):
         self.pad, self.history_only, self.mode = pad_id, history_only_tokens, mode
+        if history_limit is not None and history_limit < 1:
+            raise ValueError('history_limit должен быть положительным')
+        self.history_limit = history_limit
 
     def __call__(self, rows):
         histories = [r['history'] if self.mode != 'text' else np.empty((0, 3), np.int32) for r in rows]
+        if self.history_limit is not None:
+            histories = [h[-self.history_limit:] for h in histories]
         texts = [r['tokens'] if self.mode != 'history' else self.history_only for r in rows]
         B, H, T, P = len(rows), max(map(len, histories)), max(map(len, texts)), max(len(r['targets']) for r in rows)
         b = {'hist': torch.zeros(B, H, dtype=torch.long), 'hcount': torch.zeros(B, H, dtype=torch.long),
